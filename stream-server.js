@@ -13,14 +13,15 @@ const wss = new WebSocket.Server({
 
 // Store active connections
 const clients = new Set();
-let streamSource = null;
+// Store active stream sources
+const streamSources = new Map(); // roomId -> source connection
 let lastFrameTime = 0;
 let frameCount = 0;
 
 // Log performance stats periodically
 setInterval(() => {
   if (frameCount > 0) {
-    console.log(`Streaming at ${frameCount} fps, ${clients.size} clients connected`);
+    console.log(`Streaming at ${frameCount} fps, ${clients.size} clients connected, ${streamSources.size} active sources`);
     frameCount = 0;
   }
 }, 5000);
@@ -47,7 +48,7 @@ wss.on('connection', (ws) => {
   ws.send(JSON.stringify({
     type: 'info',
     message: 'Connected to Edrys WebSocket streaming server',
-    hasSource: streamSource !== null,
+    sources: Array.from(streamSources.keys()),
     clients: clients.size - 1 // Exclude self
   }));
 
@@ -67,27 +68,86 @@ wss.on('connection', (ws) => {
       }
       
       if (data.type === 'register-source') {
-        if (streamSource) {
-          // If we already have a source, notify the new client
+        // Require a roomId for registration
+        if (!data.roomId) {
           ws.send(JSON.stringify({
             type: 'error',
-            message: 'Another client is already streaming'
+            message: 'Room ID is required to register as source'
           }));
-        } else {
-          streamSource = ws;
-          console.log('Stream source registered');
-          
-          // Notify all clients that a source has connected
-          clients.forEach((client) => {
-            if (client !== streamSource && client.readyState === WebSocket.OPEN) {
-              client.send(JSON.stringify({
-                type: 'info',
-                message: 'Stream source connected'
-              }));
-            }
-          });
+          return;
         }
-      } else if (data.type === 'frame' && ws === streamSource) {
+
+        const roomId = data.roomId;
+        
+        // Check if this room already has a source
+        if (streamSources.has(roomId)) {
+          // If the source is still connected, reject new registration
+          const existingSource = streamSources.get(roomId);
+          if (existingSource.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: `Room ${roomId} already has an active source`
+            }));
+            return;
+          } else {
+            // If existing source is no longer connected, remove it
+            streamSources.delete(roomId);
+          }
+        }
+        
+        // Register this client as the source for the room
+        ws.isSource = true;
+        ws.roomId = roomId;
+        streamSources.set(roomId, ws);
+        console.log(`Stream source registered for room: ${roomId}`);
+        
+        // Confirm successful registration
+        ws.send(JSON.stringify({
+          type: 'source-registered',
+          roomId: roomId
+        }));
+        
+        // Notify all clients in the same room that a source is available
+        clients.forEach((client) => {
+          if (client !== ws && 
+              client.readyState === WebSocket.OPEN && 
+              client.roomId === roomId) {
+            client.send(JSON.stringify({
+              type: 'source-available',
+              roomId: roomId
+            }));
+          }
+        });
+      } 
+      else if (data.type === 'join-room') {
+        // Client wants to join a specific room
+        const roomId = data.roomId;
+        if (!roomId) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: 'Room ID is required to join a room'
+          }));
+          return;
+        }
+        
+        ws.roomId = roomId;
+        console.log(`Client joined room: ${roomId}`);
+        
+        // Notify the client if this room has a source
+        if (streamSources.has(roomId)) {
+          const source = streamSources.get(roomId);
+          if (source.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'source-available',
+              roomId: roomId
+            }));
+          } else {
+            // Clean up dead sources
+            streamSources.delete(roomId);
+          }
+        }
+      }
+      else if (data.type === 'frame' && ws.isSource) {
         if (!data.data) {
           console.error('Missing frame data');
           return;
@@ -100,15 +160,18 @@ wss.on('connection', (ws) => {
           lastFrameTime = now;
         }
         
-        // Broadcast video frame to all viewers with prioritization
-        const viewerCount = clients.size - 1; // Exclude source
-        if (viewerCount > 0) {
-          // Sort clients by performance so we prioritize clients that can handle the stream
-          const sortedClients = [...clients].filter(client => client !== streamSource)
-            .sort((a, b) => {
-              // Prioritize clients with lower latency and fewer dropped frames
-              return (a.clientInfo?.latency || 999) - (b.clientInfo?.latency || 999);
-            });
+        // Only send frames to clients in the same room
+        const roomClients = [...clients].filter(client => 
+          client !== ws && 
+          client.readyState === WebSocket.OPEN && 
+          client.roomId === ws.roomId
+        );
+        
+        if (roomClients.length > 0) {
+          // Sort clients by performance for more efficient delivery
+          const sortedClients = roomClients.sort((a, b) => {
+            return (a.clientInfo?.latency || 999) - (b.clientInfo?.latency || 999);
+          });
             
           // Use a slight delay between sends to avoid network congestion
           sortedClients.forEach((client, index) => {
@@ -163,16 +226,17 @@ wss.on('connection', (ws) => {
     console.log('Client disconnected');
     clients.delete(ws);
     
-    if (ws === streamSource) {
-      console.log('Stream source disconnected');
-      streamSource = null;
+    // If this was a stream source, remove it and notify room clients
+    if (ws.isSource && ws.roomId) {
+      console.log(`Stream source disconnected from room: ${ws.roomId}`);
+      streamSources.delete(ws.roomId);
       
-      // Notify all clients that the source has disconnected
+      // Notify room clients that the source has disconnected
       clients.forEach((client) => {
-        if (client.readyState === WebSocket.OPEN) {
+        if (client.readyState === WebSocket.OPEN && client.roomId === ws.roomId) {
           client.send(JSON.stringify({
-            type: 'info',
-            message: 'Stream source disconnected'
+            type: 'source-disconnected',
+            roomId: ws.roomId
           }));
         }
       });
@@ -184,8 +248,8 @@ wss.on('connection', (ws) => {
     console.error('WebSocket error:', error);
     // Remove client on error
     clients.delete(ws);
-    if (ws === streamSource) {
-      streamSource = null;
+    if (ws.isSource && ws.roomId) {
+      streamSources.delete(ws.roomId);
     }
   });
 });
